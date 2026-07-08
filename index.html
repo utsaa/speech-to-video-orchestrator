@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Speech to Video</title>
+  <style>
+    body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      text-align: center;
+      margin: 2em;
+    }
+
+    #video {
+      border: 2px solid #333;
+      background: #000;
+      width: 384px;
+      height: 384px;
+      object-fit: cover;
+      /* Smooth interpolation to hide pixelation */
+      image-rendering: auto;
+      transition: filter 0.3s;
+    }
+
+    #video.enhanced {
+      filter: contrast(1.15) brightness(1.05) saturate(1.15) url(#sharpen);
+    }
+
+    button {
+      padding: 10px 24px;
+      font-size: 16px;
+      margin: 10px;
+      cursor: pointer;
+    }
+
+    #micToggle {
+      background: #2a2;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      transition: background 0.2s;
+    }
+
+    #micToggle.muted {
+      background: #a22;
+    }
+
+    #status {
+      color: #888;
+      margin: 10px;
+      font-size: 14px;
+    }
+
+    #buffer-gauge {
+      font-size: 12px;
+      color: #888;
+      margin: 4px;
+    }
+
+    #buffer-bar-container {
+      display: inline-block;
+      width: 200px;
+      height: 10px;
+      background: #333;
+      border-radius: 5px;
+      overflow: hidden;
+      vertical-align: middle;
+    }
+
+    #buffer-bar {
+      height: 100%;
+      width: 0%;
+      background: #0a0;
+      transition: width 0.15s;
+    }
+  </style>
+</head>
+
+<body>
+  <svg width="0" height="0" style="position:absolute; z-index:-1;">
+    <filter id="sharpen">
+      <!-- Anti-pixelation: slight blur to hide blocks, then strong sharpen -->
+      <feGaussianBlur stdDeviation="0.4" result="blurred" />
+      <feConvolveMatrix in="blurred" order="3 3" preserveAlpha="true" kernelMatrix="0 -1 0 -1 5 -1 0 -1 0" />
+    </filter>
+  </svg>
+  <h2>Speech to Video</h2>
+  <div><img id="video" class="enhanced" /></div>
+  <div>
+    <button id="startBtn" onclick="start()">Start</button>
+    <button id="micToggle" onclick="toggleMic()" disabled>🎙️ Mic On</button>
+    <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+    <button id="flushBtn" onclick="sendFlush()" disabled>Force Flush</button>
+  </div>
+  <div style="margin: 10px; display: flex; flex-direction: column; align-items: center; gap: 5px;">
+    <label for="volumeSlider" style="color: #888; font-size: 14px;">TTS Volume: <span id="volumeVal">400%</span></label>
+    <input type="range" id="volumeSlider" min="100" max="700" value="400" style="width: 200px;">
+  </div>
+  <div style="margin-top: 10px;">
+    <label style="cursor: pointer; font-size: 14px; color: #aaa;">
+      <input type="checkbox" id="enhanceToggle" checked onchange="toggleEnhance()">
+      ✨ Real-time Quality Enhancement (Sharpen & Contrast)
+    </label>
+  </div>
+  <div id="status">Click Start to begin.</div>
+  <div id="vad-indicator" style="font-size:12px;color:#555;margin:4px;">VAD: idle</div>
+  <div id="buffer-gauge">
+    Buffer: <span id="buffer-count">0</span> frames
+    <div id="buffer-bar-container">
+      <div id="buffer-bar"></div>
+    </div>
+  </div>
+  <script>
+    // ---------------------------------------------------------------------------
+    // Configuration — change these to match --width / --height in app.py
+    // ---------------------------------------------------------------------------
+    const VIDEO_W = {{ VIDEO_W }};
+    const VIDEO_H = {{ VIDEO_H }};
+
+    const ClientSignal = {
+      FLUSH_REQUEST: "FLUSH_REQUEST"
+    };
+
+    let ws, micCtx, source, processor, stream, playCtx, playNextTime;
+    let micMuted = false;  // When true, don't send audio to server
+
+    let globalGainNode = null;
+    let globalCompressorNode = null;
+    let globalFilterNode = null;
+    let volumeSlider = document.getElementById('volumeSlider');
+    let volumeVal = document.getElementById('volumeVal');
+    volumeSlider.addEventListener('input', (e) => {
+      const val = e.target.value;
+      if (volumeVal) volumeVal.textContent = `${val}%`;
+      if (globalGainNode) {
+        globalGainNode.gain.value = val / 100.0;
+      }
+    });
+
+    // Apply dimensions to the video element on load
+    (function () {
+      const img = document.getElementById('video');
+      img.width = VIDEO_W;
+      img.height = VIDEO_H;
+    })();
+
+    // ---------------------------------------------------------------------------
+    // Frame buffer: accumulate frames and play back at a steady FPS
+    // ---------------------------------------------------------------------------
+    const TARGET_FPS = {{ TARGET_FPS }};        // Matching server default (app.py)
+    const COLD_START_SECS = 3.0; // User-requested 0.5 buffer
+    const MIN_BUFFER = Math.floor(COLD_START_SECS * TARGET_FPS);
+    const MAX_BUFFER = 2000;      // discard oldest if buffer grows beyond this
+    let frameBuffer = [];         // array of blob URLs (JPEG)
+    let audioQueue = [];          // array of ArrayBuffers (float32 PCM)
+    let playbackTimer = null;     // setInterval id
+    let playbackStarted = false;
+    let flushReceived = false;    // New: robust bypass flag
+
+    let playbackStartAudioTime = 0;
+    let framesPlayed = 0;
+
+    function playLoop() {
+      if (!playbackStarted) return;
+
+      const elapsed = playCtx.currentTime - playbackStartAudioTime;
+      const targetFrame = Math.floor(elapsed * TARGET_FPS);
+
+      while (framesPlayed < targetFrame) {
+        if (frameBuffer.length === 0) {
+          // Buffer underrun — pause audio and video and wait for re-buffer
+          console.log("[PLAY] Buffer empty. Suspending audio and video.");
+          // Only suspend if we expect more frames. If flushReceived is true, let the audio tail finish playing!
+          if (!flushReceived) {
+            playCtx.suspend();
+          }
+          stopPlayback();
+          playbackStarted = false;
+          flushReceived = false; // Reset so next sentence buffers properly!
+          setStatus('Buffering (empty)...');
+          return;
+        }
+
+        const url = frameBuffer.shift();
+        const img = document.getElementById('video');
+        const old = img.src;
+        img.src = url;
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+        framesPlayed++;
+      }
+
+      updateBufferGauge();
+      playbackTimer = requestAnimationFrame(playLoop);
+    }
+
+    function startPlayback() {
+      if (playbackTimer) return;
+
+      if (!playCtx) {
+        console.error("[PLAY] startPlayback failed: playCtx is null! WebSocket might have received frames before mic permission was granted.");
+        setStatus("Waiting for audio context...");
+        return;
+      }
+
+      console.log(`[PLAY] startPlayback called. Buffer: ${frameBuffer.length}, Audio: ${audioQueue.length}`);
+
+      if (playCtx.state === 'suspended') {
+        console.log("[PLAY] Resuming suspended AudioContext...");
+        playCtx.resume();
+      }
+
+      playbackStarted = true;
+      setStatus('Playing');
+
+      // 1. Drain any buffered audio immediately
+      while (audioQueue.length > 0) {
+        const payload = audioQueue.shift();
+        scheduleAudio(payload);
+      }
+
+      // 2. Start video loop tied to audio time
+      playbackStartAudioTime = playCtx.currentTime - (framesPlayed / TARGET_FPS);
+      playbackTimer = requestAnimationFrame(playLoop);
+    }
+
+    function stopPlayback() {
+      if (playbackTimer) {
+        cancelAnimationFrame(playbackTimer);
+        playbackTimer = null;
+      }
+    }
+
+    function scheduleAudio(payload) {
+      if (!playCtx) return;
+      const f32 = new Float32Array(payload);
+      const buf = playCtx.createBuffer(1, f32.length, 16000);
+      buf.copyToChannel(f32, 0);
+      const src = playCtx.createBufferSource();
+      src.buffer = buf;
+
+      if (!globalGainNode) {
+        // 1. High-pass filter to remove low-end rumble or noise
+        globalFilterNode = playCtx.createBiquadFilter();
+        globalFilterNode.type = 'highpass';
+        globalFilterNode.frequency.value = 85; // Hz
+
+        // 2. Dynamics Compressor to prevent clipping and balance loud/quiet parts
+        globalCompressorNode = playCtx.createDynamicsCompressor();
+        globalCompressorNode.threshold.value = -24;
+        globalCompressorNode.knee.value = 30;
+        globalCompressorNode.ratio.value = 12;
+        globalCompressorNode.attack.value = 0.003;
+        globalCompressorNode.release.value = 0.25;
+
+        // 3. Gain node for makeup volume (controlled by slider)
+        globalGainNode = playCtx.createGain();
+        globalGainNode.gain.value = volumeSlider ? volumeSlider.value / 100.0 : 4.0;
+
+        // Chain them together
+        globalFilterNode.connect(globalCompressorNode);
+        globalCompressorNode.connect(globalGainNode);
+        globalGainNode.connect(playCtx.destination);
+      }
+
+      // Connect new audio source to the start of our chain
+      src.connect(globalFilterNode);
+
+      const now = playCtx.currentTime;
+      if (playNextTime < now) playNextTime = now;
+      src.start(playNextTime);
+      playNextTime += buf.duration;
+    }
+
+    function updateBufferGauge() {
+      const el = document.getElementById('buffer-count');
+      const bar = document.getElementById('buffer-bar');
+      if (el) el.textContent = frameBuffer.length;
+      if (bar) bar.style.width = Math.min(100, (frameBuffer.length / MIN_BUFFER) * 100) + '%';
+    }
+
+    // Client-side Voice Activity Detection (RMS threshold)
+    const VAD_RMS_THRESHOLD = 0.015;   // Increased to avoid noise
+    const VAD_HOLD_CHUNKS = 15;       // Increased to 15 (1.92s) so server's 1.5s VAD can trigger
+    let vadHoldCounter = 0;
+
+    function computeRMS(pcm) {
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+      return Math.sqrt(sum / pcm.length);
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg;
+    }
+
+    async function start() {
+      setStatus('Connecting...');
+      const wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      ws = new WebSocket(wsProto + location.host + '/ws');
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = async () => {
+        setStatus('Connected. Requesting mic...');
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+          micCtx = new AudioContext({ sampleRate: 16000 });
+          source = micCtx.createMediaStreamSource(stream);
+          processor = micCtx.createScriptProcessor(4096, 1, 1);
+          processor.onaudioprocess = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              const pcm = e.inputBuffer.getChannelData(0);
+              const isTtsSpeaking = playCtx && playCtx.currentTime < playNextTime;
+
+              if (micMuted || isTtsSpeaking) {
+                // Send pure silence to prevent echo loops and keep STT VAD alive when muted
+                const silentPcm = new Float32Array(pcm.length);
+                ws.send(silentPcm.buffer);
+                const indicator = document.getElementById('vad-indicator');
+                if (indicator) { indicator.textContent = micMuted ? 'VAD: muted' : 'VAD: silent'; indicator.style.color = '#555'; }
+              } else {
+                // Unconditionally send actual mic audio
+                ws.send(pcm.buffer);
+                const rms = computeRMS(pcm);
+                const indicator = document.getElementById('vad-indicator');
+                if (rms >= VAD_RMS_THRESHOLD) {
+                  if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
+                } else {
+                  if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }
+                }
+              }
+            }
+          };
+          source.connect(processor);
+          processor.connect(micCtx.destination);
+
+          // Playback context for returned audio (16 kHz)
+          playCtx = new AudioContext({ sampleRate: 16000 });
+          playNextTime = 0;
+
+          document.getElementById('startBtn').disabled = true;
+          document.getElementById('stopBtn').disabled = false;
+          document.getElementById('micToggle').disabled = false;
+          document.getElementById('flushBtn').disabled = false;
+          setStatus('Buffering...');
+        } catch (err) {
+          setStatus('Mic error: ' + err.message);
+        }
+      };
+
+      ws.onmessage = (e) => {
+        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 1) return;
+        const view = new Uint8Array(e.data);
+        const tag = view[0];
+        const payload = e.data.slice(1);
+
+        console.log(`[WS] Received tag: 0x0${tag} (Payload size: ${payload.byteLength} bytes)`);
+
+        if (tag === 0x01) {
+          // JPEG video frame → push to buffer
+          const blob = new Blob([payload], { type: 'image/jpeg' });
+          const url = URL.createObjectURL(blob);
+
+          // Cap the buffer to avoid unbounded memory growth
+          if (frameBuffer.length >= MAX_BUFFER) {
+            const discarded = frameBuffer.shift();
+            URL.revokeObjectURL(discarded);
+          }
+          frameBuffer.push(url);
+          updateBufferGauge();
+
+          // Start playback once we have enough frames OR flush arrived
+          if (!playbackStarted) {
+            if (frameBuffer.length >= MIN_BUFFER || (flushReceived && frameBuffer.length > 0)) {
+              console.log(`[BUFFER] Starting playback. Current: ${frameBuffer.length}, Threshold: ${MIN_BUFFER}, Flush: ${flushReceived}`);
+              startPlayback();
+            } else {
+              setStatus(`Buffering (${frameBuffer.length}/${MIN_BUFFER})...`);
+            }
+          }
+        } else if (tag === 0x02 && playCtx) {
+          // float32 PCM audio chunk
+          if (playbackStarted) {
+            scheduleAudio(payload);
+          } else {
+            audioQueue.push(payload);
+          }
+        } else if (tag === 0x03) {
+          // Flush signal: start playback immediately if we have any data
+          flushReceived = true;
+          if (!playbackStarted && frameBuffer.length > 0) {
+            console.log("[PLAY] Flush signal received. Bypassing buffer.");
+            setStatus('Playing (Flushed)...');
+            startPlayback();
+          } else if (playCtx && playCtx.state === 'suspended') {
+            // If buffer was empty but audio was suspended, we must resume it to let the audio tail finish 
+            // playing, otherwise isTtsSpeaking stays true forever!
+            console.log("[PLAY] Flush signal received, buffer empty. Resuming audio tail.");
+            playCtx.resume();
+          }
+        }
+      };
+
+      ws.onclose = () => { setStatus('Disconnected.'); cleanup(); };
+      ws.onerror = () => { setStatus('WebSocket error.'); cleanup(); };
+    }
+
+    function stop() {
+      if (ws) ws.close();
+      cleanup();
+    }
+
+    function toggleMic() {
+      micMuted = !micMuted;
+      const btn = document.getElementById('micToggle');
+      if (micMuted) {
+        btn.textContent = '🔇 Mic Off';
+        btn.classList.add('muted');
+        document.getElementById('vad-indicator').textContent = 'VAD: muted';
+        document.getElementById('vad-indicator').style.color = '#a22';
+      } else {
+        btn.textContent = '🎙️ Mic On';
+        btn.classList.remove('muted');
+      }
+    }
+
+    function toggleEnhance() {
+      const video = document.getElementById('video');
+      const isChecked = document.getElementById('enhanceToggle').checked;
+      if (isChecked) {
+        video.classList.add('enhanced');
+      } else {
+        video.classList.remove('enhanced');
+      }
+    }
+
+    function cleanup() {
+      stopPlayback();
+      playbackStarted = false;
+      flushReceived = false;
+      // Release any remaining buffered blob URLs
+      for (const url of frameBuffer) URL.revokeObjectURL(url);
+      frameBuffer = [];
+      audioQueue = [];
+      updateBufferGauge();
+      if (processor) { processor.disconnect(); processor = null; }
+      if (source) { source.disconnect(); source = null; }
+      if (micCtx) { micCtx.close(); micCtx = null; }
+      if (playCtx) { playCtx.close(); playCtx = null; }
+      globalGainNode = null;
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      playNextTime = 0;
+      vadHoldCounter = 0;
+      micMuted = false;
+      const micBtn = document.getElementById('micToggle');
+      micBtn.disabled = true;
+      micBtn.textContent = '🎙️ Mic On';
+      micBtn.classList.remove('muted');
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      document.getElementById('flushBtn').disabled = true;
+    }
+
+    function sendFlush() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(ClientSignal.FLUSH_REQUEST);
+      }
+    }
+  </script>
+
+</body>
+
+</html>
